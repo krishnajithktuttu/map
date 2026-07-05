@@ -2,11 +2,13 @@ import http.server
 import socketserver
 import threading
 import json
+import os
+import glob
 import webview
 
 PORT = 8080
 
-# --- Advanced HTML/JS Interface Engine with Precision Sidebars ---
+# --- Clean HTML/JS Interface Engine with Save/Load Pipeline ---
 HTML_MAIN = """
 <!DOCTYPE html>
 <html>
@@ -20,9 +22,7 @@ HTML_MAIN = """
         #app-container { display: flex; height: 100vh; }
 
         /* Left Control Panel Panel */
-        #sidebar { width: 320px; background: #2c3e50; color: white; padding: 20px; box-shadow: 2px 0 10px rgba(0,0,0,0.3); display: flex; flex-direction: column; gap: 15px; z-index: 3000; }
-
-        /* White canvas background behind the map tiles */
+        #sidebar { width: 320px; background: #2c3e50; color: white; padding: 20px; box-shadow: 2px 0 10px rgba(0,0,0,0.3); display: flex; flex-direction: column; gap: 15px; z-index: 3000; overflow-y: auto; }
         #map { flex: 1; height: 100%; z-index: 1; background: #ffffff !important; } 
 
         /* UI Components */
@@ -34,7 +34,7 @@ HTML_MAIN = """
 
         .control-label { font-size: 13px; font-weight: bold; margin-bottom: 4px; display: block; color: #bdc3c7; }
         input[type=range] { width: 100%; margin-bottom: 10px; accent-color: #1abc9c; }
-        input[type=text] { width: 100%; padding: 8px; background: #34495e; color: white; border: 1px solid #1abc9c; border-radius: 4px; box-sizing: border-box; margin-bottom: 10px; }
+        input[type=text], select { width: 100%; padding: 8px; background: #34495e; color: white; border: 1px solid #1abc9c; border-radius: 4px; box-sizing: border-box; margin-bottom: 10px; }
 
         .move-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; width: 150px; margin: 0 auto; }
         .move-btn { text-align: center; padding: 8px; background: #34495e; }
@@ -44,51 +44,79 @@ HTML_MAIN = """
             background: transparent !important;
             border: none !important;
             box-shadow: none !important;
-            color: #2c3e50 !important; /* Dark text for high contrast on the final white PDF canvas */
+            color: #ffffff !important;
             font-weight: bold !important;
             font-size: 14px !important;
+            text-shadow: 1px 1px 2px #000, -1px -1px 2px #000;
             pointer-events: none !important;
         }
+
+        /* Modal popup overlay */
+        .modal { display: none; position: fixed; z-index: 4000; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); align-items: center; justify-content: center; }
+        .modal-content { background: #2c3e50; padding: 25px; border-radius: 6px; border: 2px solid #1abc9c; width: 350px; color: white; }
+        .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 15px; }
+        .modal-btn { padding: 8px 16px; border-radius: 4px; border: none; font-weight: bold; cursor: pointer; }
+        .modal-save { background: #1abc9c; color: white; }
+        .modal-cancel { background: #7f8c8d; color: white; }
     </style>
 </head>
 <body>
+
+<div id="save-modal" class="modal">
+    <div class="modal-content">
+        <h4 style="margin-top:0; color:#1abc9c;">Save Workspace Layout</h4>
+        <label class="control-label">Enter Map Name</label>
+        <input type="text" id="save-map-name" placeholder="E.g., Site Blueprint A">
+        <div class="modal-actions">
+            <button class="modal-btn modal-cancel" onclick="closeSaveModal()">Cancel</button>
+            <button class="modal-btn modal-save" onclick="confirmModalSave()">Save Map</button>
+        </div>
+    </div>
+</div>
 
 <div id="app-container">
     <div id="sidebar">
         <h3>1. Drawing Layer Tools</h3>
         <div class="tool-group">
-            <button id="btn-poly" onclick="startDraw('polygon')">⬡ Draw Custom Polygon</button>
-            <button id="btn-rect" onclick="startDraw('rectangle')">⬜ Draw Box / Rectangle</button>
-            <button id="btn-line" onclick="startDraw('polyline')">➖ Draw Line</button>
+            <button id="btn-poly" onclick="startDraw('polygon')">Draw Custom Polygon</button>
+            <button id="btn-rect" onclick="startDraw('rectangle')">Draw Box / Rectangle</button>
+            <button id="btn-line" onclick="startDraw('polyline')">Draw Line</button>
         </div>
 
         <h3>2. Precision Editor Matrix</h3>
         <div id="editor-controls" style="opacity: 0.4; pointer-events: none;">
             <div>
-                <span class="control-label">🏷️ Label Text</span>
+                <span class="control-label">Label Text</span>
                 <input type="text" id="shape-label" placeholder="Type shape label here..." oninput="updateShapeLabel()">
             </div>
             <div>
-                <span class="control-label">🔄 Rotation Angle ($0^\circ - 360^\circ$)</span>
+                <span class="control-label">Rotation Angle (0 - 360)</span>
                 <input type="range" id="slide-rotate" min="0" max="360" value="0" oninput="transformActiveShape()">
             </div>
             <div>
-                <span class="control-label">🎚️ Scale Modifier</span>
+                <span class="control-label">Scale Modifier</span>
                 <input type="range" id="slide-scale" min="50" max="200" value="100" oninput="transformActiveShape()">
             </div>
             <div>
-                <span class="control-label" style="text-align:center; margin-bottom:8px;">🖐️ Nudge Positioning</span>
+                <span class="control-label" style="text-align:center; margin-bottom:8px;">Nudge Positioning</span>
                 <div class="move-grid">
-                    <div></div><button class="move-btn" onclick="nudgeShape('up')">▲</button><div></div>
-                    <button class="move-btn" onclick="nudgeShape('left')">◀</button><div></div><button class="move-btn" onclick="nudgeShape('right')">▶</button>
-                    <div></div><button class="move-btn" onclick="nudgeShape('down')">▼</button><div></div>
+                    <div></div><button class="move-btn" onclick="nudgeShape('up')">Up</button><div></div>
+                    <button class="move-btn" onclick="nudgeShape('left')">Left</button><div></div><button class="move-btn" onclick="nudgeShape('right')">Right</button>
+                    <div></div><button class="move-btn" onclick="nudgeShape('down')">Down</button><div></div>
                 </div>
             </div>
         </div>
 
-        <button onclick="exportDrawingToPDF()" style="background: #2980b9; text-align: center; margin-top: auto;">Export Drawing to PDF 📐</button>
-        <button onclick="clearMap()" style="background: #e74c3c; text-align: center;">Clear Workspace 🧹</button>
-        <button onclick="finalizeAndSave()" style="background: #27ae60; text-align: center;">Finalize & Save Boundary 💾</button>
+        <h3>3. Load Workspace Menu</h3>
+        <div>
+            <label class="control-label">Select Saved Map Configuration</label>
+            <select id="load-menu-select" onchange="triggerLoadMap()">
+                <option value="">-- No Active Layout Loaded --</option>
+            </select>
+        </div>
+
+        <button onclick="exportDrawingToPDF()" style="background: #2980b9; text-align: center; margin-top: auto;">Export Drawing to PDF</button>
+        <button onclick="clearMap()" style="background: #e74c3c; text-align: center;">Clear Workspace</button>
     </div>
 
     <div id="map"></div>
@@ -99,26 +127,125 @@ HTML_MAIN = """
 <script src="https://unpkg.com/leaflet-simple-map-screenshoter"></script>
 
 <script>
-    const map = L.map('map', { zoomControl: true }).setView([12.5055, 74.9902], 16);
+    const normalMap = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 22, maxNativeZoom: 19, attribution: '© OpenStreetMap', crossOrigin: true
+    });
 
-    // Keep the live OpenStreetMap background tile active on your screen!
-    const baseTileLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        maxZoom: 19,
-        attribution: '© OpenStreetMap',
-        crossOrigin: true
-    }).addTo(map);
+    const satelliteCleanMap = L.tileLayer('https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+        maxZoom: 22, maxNativeZoom: 20, attribution: '© Google Imagery', crossOrigin: true
+    });
+
+    const satelliteHybridMap = L.tileLayer('https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', {
+        maxZoom: 22, maxNativeZoom: 20, attribution: '© Google Hybrid', crossOrigin: true
+    });
+
+    const map = L.map('map', { 
+        zoomControl: true, maxZoom: 22, layers: [satelliteHybridMap]
+    }).setView([12.5079, 74.9890], 18);
+
+    const baseLayers = {
+        "Normal Map": normalMap,
+        "Satellite (Clean Canvas)": satelliteCleanMap,
+        "Satellite + Labels & Shops": satelliteHybridMap
+    };
+    L.control.layers(baseLayers, null, { position: 'topright', collapsed: false }).addTo(map);
 
     const screenshoter = L.simpleMapScreenshoter({
-        hidden: true,
-        cropImageByInnerWH: true
+        hidden: true, cropImageByInnerWH: true
     }).addTo(map);
 
     const drawnItems = new L.FeatureGroup().addTo(map);
     let shapeOrderStack = [];
     let activeDrawHandler = null;
-
     let selectedLayer = null;
     let baseCoordinates = null; 
+
+    // Refresh layout dropdown menu on app startup
+    window.addEventListener('pywebviewready', function() {
+        refreshLoadMenu();
+    });
+
+    function refreshLoadMenu() {
+        pywebview.api.list_saved_maps().then(function(response) {
+            const selectEl = document.getElementById('load-menu-select');
+            // Retain default first option
+            selectEl.innerHTML = '<option value="">-- No Active Layout Loaded --</option>';
+            response.forEach(function(fileName) {
+                const opt = document.createElement('option');
+                opt.value = fileName;
+                opt.textContent = fileName.replace('.json', '');
+                selectEl.appendChild(opt);
+            });
+        });
+    }
+
+    function triggerLoadMap() {
+        const fileTarget = document.getElementById('load-menu-select').value;
+        if (!fileTarget) return;
+
+        pywebview.api.load_gis_layer(fileTarget).then(function(geojsonStr) {
+            if (!geojsonStr) return;
+            clearMap();
+
+            const data = JSON.parse(geojsonStr);
+            L.geoJSON(data, {
+                style: function(feature) {
+                    if (feature.geometry.type === 'LineString') {
+                        return { color: '#e74c3c', weight: 4 };
+                    } else if (feature.properties && feature.properties.isRect) {
+                        return { color: '#27ae60', fillOpacity: 0.2, weight: 3 };
+                    }
+                    return { color: '#9b59b6', fillOpacity: 0.3, weight: 3 };
+                },
+                onEachFeature: function (feature, layer) {
+                    drawnItems.addLayer(layer);
+                    shapeOrderStack.push(layer);
+                    if (feature.properties && feature.properties.label) {
+                        layer.shapeLabel = feature.properties.label;
+                        layer.bindTooltip(feature.properties.label, {
+                            permanent: true, direction: 'center', className: 'shape-label-tooltip'
+                        });
+                    }
+                }
+            });
+        });
+    }
+
+    function openSaveModal() {
+        deselectShape();
+        document.getElementById('save-map-name').value = '';
+        document.getElementById('save-modal').style.display = 'flex';
+        document.getElementById('save-map-name').focus();
+    }
+
+    function closeSaveModal() {
+        document.getElementById('save-modal').style.display = 'none';
+    }
+
+    function confirmModalSave() {
+        const inputName = document.getElementById('save-map-name').value.trim();
+        if (!inputName) {
+            alert("Please enter a valid name for your layout.");
+            return;
+        }
+
+        // Tag rectangles explicitly prior to generation
+        drawnItems.eachLayer(function(layer) {
+            layer.feature = layer.feature || { type: "Feature", properties: {} };
+            if(layer.shapeLabel) {
+                layer.feature.properties.label = layer.shapeLabel;
+            }
+            if (layer instanceof L.Rectangle) {
+                layer.feature.properties.isRect = true;
+            }
+        });
+
+        const dataStr = JSON.stringify(drawnItems.toGeoJSON(), null, 4);
+        pywebview.api.save_gis_layer(inputName, dataStr).then(function(success) {
+            closeSaveModal();
+            refreshLoadMenu();
+        });
+    }
 
     function startDraw(type) {
         if (activeDrawHandler) activeDrawHandler.disable();
@@ -148,7 +275,6 @@ HTML_MAIN = """
         document.getElementById('btn-poly').className = '';
         document.getElementById('btn-rect').className = '';
         activeDrawHandler = null;
-
         selectShape(layer);
     });
 
@@ -166,10 +292,8 @@ HTML_MAIN = """
         selectedLayer = layer;
         selectedLayer.setStyle({ color: '#f1c40f', dashArray: '5, 5' });
         baseCoordinates = JSON.parse(JSON.stringify(layer.getLatLngs()));
-
         document.getElementById('editor-controls').style.opacity = "1";
         document.getElementById('editor-controls').style.pointerEvents = "auto";
-
         document.getElementById('slide-rotate').value = 0;
         document.getElementById('slide-scale').value = 100;
         document.getElementById('shape-label').value = layer.shapeLabel || "";
@@ -192,28 +316,22 @@ HTML_MAIN = """
         if (!selectedLayer) return;
         const textVal = document.getElementById('shape-label').value;
         selectedLayer.shapeLabel = textVal;
-
         if (textVal.trim() === "") {
             selectedLayer.unbindTooltip();
         } else {
             selectedLayer.bindTooltip(textVal, {
-                permanent: true,
-                direction: 'center',
-                className: 'shape-label-tooltip'
+                permanent: true, direction: 'center', className: 'shape-label-tooltip'
             }).openTooltip();
         }
     }
 
     function transformActiveShape() {
         if (!selectedLayer || !baseCoordinates) return;
-
         const angleDeg = parseFloat(document.getElementById('slide-rotate').value);
         const scalePct = parseFloat(document.getElementById('slide-scale').value) / 100.0;
         const angleRad = angleDeg * (Math.PI / 180.0);
-
         let bounds = L.latLngBounds(flattenPoints(baseCoordinates));
         let center = bounds.getCenter();
-
         let newLatLngs = applyTransformRecursive(baseCoordinates, center, angleRad, scalePct);
         selectedLayer.setLatLngs(newLatLngs);
         selectedLayer.redraw();
@@ -227,31 +345,22 @@ HTML_MAIN = """
         if (Array.isArray(item)) {
             return item.map(subItem => applyTransformRecursive(subItem, center, angleRad, scaleFactor));
         }
-        let lat = item.lat;
-        let lng = item.lng;
-
-        let x = lng - center.lng;
-        let y = lat - center.lat;
-
-        x *= scaleFactor;
-        y *= scaleFactor;
-
+        let lat = item.lat; let lng = item.lng;
+        let x = lng - center.lng; let y = lat - center.lat;
+        x *= scaleFactor; y *= scaleFactor;
         let xRot = x * Math.cos(angleRad) - y * Math.sin(angleRad);
         let yRot = x * Math.sin(angleRad) + y * Math.cos(angleRad);
-
         return L.latLng(center.lat + yRot, center.lng + xRot);
     }
 
     function nudgeShape(direction) {
         if (!selectedLayer) return;
-        const offset = 0.00005; 
+        const offset = 0.00002; 
         let latDel = 0, lngDel = 0;
-
         if (direction === 'up') latDel = offset;
         if (direction === 'down') latDel = -offset;
         if (direction === 'left') lngDel = -offset;
         if (direction === 'right') lngDel = offset;
-
         baseCoordinates = shiftCoordsRecursive(baseCoordinates, latDel, lngDel);
         transformActiveShape();
     }
@@ -264,17 +373,28 @@ HTML_MAIN = """
     }
 
     window.addEventListener('keydown', function(event) {
-        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
-            if (document.activeElement === document.getElementById('shape-label')) return;
+        if (document.activeElement === document.getElementById('shape-label') || document.activeElement === document.getElementById('save-map-name')) return;
+
+        // Ctrl + S intercepted to Open Save Dialog Modal Popup
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
             event.preventDefault();
-            if (shapeOrderStack.length === 0) return;
-            deselectShape();
-            const lastLayer = shapeOrderStack.pop();
-            drawnItems.removeLayer(lastLayer);
+            openSaveModal();
+            return;
+        }
+
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
+            event.preventDefault();
+            if (activeDrawHandler && typeof activeDrawHandler.deleteLastVertex === 'function') {
+                activeDrawHandler.deleteLastVertex();
+            } else {
+                if (shapeOrderStack.length === 0) return;
+                deselectShape();
+                const lastLayer = shapeOrderStack.pop();
+                drawnItems.removeLayer(lastLayer);
+            }
         }
 
         if (event.key === 'Delete' || event.key === 'Backspace') {
-            if (document.activeElement === document.getElementById('shape-label')) return; 
             if (selectedLayer) {
                 event.preventDefault();
                 const targetIdx = shapeOrderStack.indexOf(selectedLayer);
@@ -292,38 +412,25 @@ HTML_MAIN = """
         shapeOrderStack = [];
     }
 
-    // --- AUTOMATIC BACKGROUND REMOVAL ACTION ONLY FOR THE SNAPSHOT ---
     function exportDrawingToPDF() {
-        deselectShape(); // Clear selected outlines before taking the picture
+        deselectShape(); 
 
-        // 1. Temporarily strip away the background imagery tiles right before screenshotting
-        map.removeLayer(baseTileLayer);
+        let activeTile = null;
+        if (map.hasLayer(normalMap)) activeTile = normalMap;
+        else if (map.hasLayer(satelliteCleanMap)) activeTile = satelliteCleanMap;
+        else if (map.hasLayer(satelliteHybridMap)) activeTile = satelliteHybridMap;
 
-        // 2. Take the picture and immediately put the map background back
+        if (activeTile) map.removeLayer(activeTile);
+
         setTimeout(() => {
             screenshoter.takeScreen('image').then(base64Image => {
-                // Restore map tiles to your app screen instantly
-                baseTileLayer.addTo(map);
-
-                // Pass the clean image data directly to the Python backend PDF compiler
+                if (activeTile) activeTile.addTo(map);
                 pywebview.api.convert_image_to_pdf(base64Image);
             }).catch(err => {
-                baseTileLayer.addTo(map); // Safety restore
-                alert("Export failed: " + err);
+                if (activeTile) activeTile.addTo(map);
+                alert("Export pipeline failed: " + err);
             });
         }, 100); 
-    }
-
-    function finalizeAndSave() {
-        deselectShape();
-        drawnItems.eachLayer(function(layer) {
-            if(layer.shapeLabel) {
-                layer.feature = layer.feature || { type: "Feature", properties: {} };
-                layer.feature.properties.label = layer.shapeLabel;
-            }
-        });
-        const data = drawnItems.toGeoJSON();
-        pywebview.api.save_gis_layer(JSON.stringify(data, null, 4));
     }
 </script>
 </body>
@@ -332,10 +439,25 @@ HTML_MAIN = """
 
 
 class Api:
-    def save_gis_layer(self, geojson_data):
-        with open("finalized_boundary.geojson", "w") as f:
+    def save_gis_layer(self, map_name, geojson_data):
+        # Cleans up illegal characters from file systems safely
+        safe_name = "".join([c for c in map_name if c.isalpha() or c.isdigit() or c in (' ', '_', '-')]).strip()
+        filename = f"{safe_name}.json"
+        with open(filename, "w") as f:
             f.write(geojson_data)
-        print("Export complete! Layer saved safely to 'finalized_boundary.geojson'")
+        print(f"Map successfully saved to '{filename}'")
+        return True
+
+    def list_saved_maps(self):
+        # Locates all saved configurations inside the local directory
+        files = glob.glob("*.json")
+        return sorted(files)
+
+    def load_gis_layer(self, filename):
+        if os.path.exists(filename):
+            with open(filename, "r") as f:
+                return f.read()
+        return ""
 
     def convert_image_to_pdf(self, base64_image_data):
         try:
@@ -352,16 +474,14 @@ class Api:
             img_buffer = BytesIO(img_bytes)
             img_reader = ImageReader(img_buffer)
 
-            # Generate Document file (Clean blueprint layout canvas sheet)
             pdf_path = "drawn_canvas_blueprint.pdf"
             pdf_canvas = canvas.Canvas(pdf_path, pagesize=landscape(A4))
             page_width, page_height = landscape(A4)
 
-            # Paint drawings onto vector PDF canvas
             pdf_canvas.drawImage(img_reader, 0, 0, width=page_width, height=page_height)
             pdf_canvas.save()
 
-            print(f"Success! Canvas artwork document saved to '{pdf_path}'")
+            print(f"Success! Map blueprint cleared. Document saved to '{pdf_path}'")
         except Exception as e:
             print(f"Backend image pipeline writing failed: {e}")
 
