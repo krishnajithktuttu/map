@@ -8,7 +8,7 @@ import webview
 
 PORT = 8080
 
-# --- Clean HTML/JS Interface Engine with Save/Load Pipeline ---
+# --- Clean HTML/JS Interface Engine with Dynamic Autosave Matrix ---
 HTML_MAIN = """
 <!DOCTYPE html>
 <html>
@@ -64,12 +64,12 @@ HTML_MAIN = """
 
 <div id="save-modal" class="modal">
     <div class="modal-content">
-        <h4 style="margin-top:0; color:#1abc9c;">Save Workspace Layout</h4>
+        <h4 style="margin-top:0; color:#1abc9c;">Create New Map File</h4>
         <label class="control-label">Enter Map Name</label>
         <input type="text" id="save-map-name" placeholder="E.g., Site Blueprint A">
         <div class="modal-actions">
             <button class="modal-btn modal-cancel" onclick="closeSaveModal()">Cancel</button>
-            <button class="modal-btn modal-save" onclick="confirmModalSave()">Save Map</button>
+            <button class="modal-btn modal-save" onclick="confirmModalSave()">Create Map</button>
         </div>
     </div>
 </div>
@@ -107,7 +107,10 @@ HTML_MAIN = """
             </div>
         </div>
 
-        <h3>3. Load Workspace Menu</h3>
+        <h3>3. Workspace Options</h3>
+        <div class="tool-group">
+            <button onclick="openSaveModal()" style="background: #27ae60; text-align: center;">Add New Map</button>
+        </div>
         <div>
             <label class="control-label">Select Saved Map Configuration</label>
             <select id="load-menu-select" onchange="triggerLoadMap()">
@@ -160,7 +163,9 @@ HTML_MAIN = """
     let selectedLayer = null;
     let baseCoordinates = null; 
 
-    // Refresh layout dropdown menu on app startup
+    // Tracks current filename context to support headless Ctrl+S updates
+    let currentLoadedMapName = ""; 
+
     window.addEventListener('pywebviewready', function() {
         refreshLoadMenu();
     });
@@ -168,25 +173,35 @@ HTML_MAIN = """
     function refreshLoadMenu() {
         pywebview.api.list_saved_maps().then(function(response) {
             const selectEl = document.getElementById('load-menu-select');
-            // Retain default first option
             selectEl.innerHTML = '<option value="">-- No Active Layout Loaded --</option>';
             response.forEach(function(fileName) {
                 const opt = document.createElement('option');
                 opt.value = fileName;
-                opt.textContent = fileName.replace('.json', '');
+                const baseName = fileName.replace('.json', '');
+                opt.textContent = baseName;
                 selectEl.appendChild(opt);
+
+                // Keep selected layout accurate in view dropdown after automated saves
+                if(baseName === currentLoadedMapName) {
+                    selectEl.value = fileName;
+                }
             });
         });
     }
 
     function triggerLoadMap() {
         const fileTarget = document.getElementById('load-menu-select').value;
-        if (!fileTarget) return;
+        if (!fileTarget) {
+            currentLoadedMapName = "";
+            clearMap();
+            return;
+        }
 
         pywebview.api.load_gis_layer(fileTarget).then(function(geojsonStr) {
             if (!geojsonStr) return;
             clearMap();
 
+            currentLoadedMapName = fileTarget.replace('.json', '');
             const data = JSON.parse(geojsonStr);
             L.geoJSON(data, {
                 style: function(feature) {
@@ -228,8 +243,18 @@ HTML_MAIN = """
             alert("Please enter a valid name for your layout.");
             return;
         }
+        currentLoadedMapName = inputName;
+        executeSilentAutosave();
+        closeSaveModal();
+    }
 
-        // Tag rectangles explicitly prior to generation
+    function executeSilentAutosave() {
+        if (!currentLoadedMapName) {
+            // No destination target explicitly configured yet - force name input wizard via the UI
+            openSaveModal();
+            return;
+        }
+
         drawnItems.eachLayer(function(layer) {
             layer.feature = layer.feature || { type: "Feature", properties: {} };
             if(layer.shapeLabel) {
@@ -241,8 +266,7 @@ HTML_MAIN = """
         });
 
         const dataStr = JSON.stringify(drawnItems.toGeoJSON(), null, 4);
-        pywebview.api.save_gis_layer(inputName, dataStr).then(function(success) {
-            closeSaveModal();
+        pywebview.api.save_gis_layer(currentLoadedMapName, dataStr).then(function(success) {
             refreshLoadMenu();
         });
     }
@@ -375,10 +399,11 @@ HTML_MAIN = """
     window.addEventListener('keydown', function(event) {
         if (document.activeElement === document.getElementById('shape-label') || document.activeElement === document.getElementById('save-map-name')) return;
 
-        // Ctrl + S intercepted to Open Save Dialog Modal Popup
+        // Ctrl + S triggers direct, clean overwrite on current map file profile
         if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
             event.preventDefault();
-            openSaveModal();
+            deselectShape();
+            executeSilentAutosave();
             return;
         }
 
@@ -440,16 +465,14 @@ HTML_MAIN = """
 
 class Api:
     def save_gis_layer(self, map_name, geojson_data):
-        # Cleans up illegal characters from file systems safely
         safe_name = "".join([c for c in map_name if c.isalpha() or c.isdigit() or c in (' ', '_', '-')]).strip()
         filename = f"{safe_name}.json"
         with open(filename, "w") as f:
             f.write(geojson_data)
-        print(f"Map successfully saved to '{filename}'")
+        print(f"Map changes updated inside profile storage layout: '{filename}'")
         return True
 
     def list_saved_maps(self):
-        # Locates all saved configurations inside the local directory
         files = glob.glob("*.json")
         return sorted(files)
 
@@ -481,7 +504,7 @@ class Api:
             pdf_canvas.drawImage(img_reader, 0, 0, width=page_width, height=page_height)
             pdf_canvas.save()
 
-            print(f"Success! Map blueprint cleared. Document saved to '{pdf_path}'")
+            print(f"Success! Canvas map blueprint cleared. Document saved to '{pdf_path}'")
         except Exception as e:
             print(f"Backend image pipeline writing failed: {e}")
 
