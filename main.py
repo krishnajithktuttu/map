@@ -8,7 +8,7 @@ import webview
 
 PORT = 8080
 
-# --- Clean HTML/JS Interface Engine with Dynamic Context Labels ---
+# --- Clean HTML/JS Interface Engine with Full Persistent Features ---
 HTML_MAIN = """
 <!DOCTYPE html>
 <html>
@@ -50,9 +50,29 @@ HTML_MAIN = """
             text-shadow: 1px 1px 2px #000, -1px -1px 2px #000;
             pointer-events: none !important;
         }
+
+        /* Modal popup overlay */
+        .modal { display: none; position: fixed; z-index: 4000; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); align-items: center; justify-content: center; }
+        .modal-content { background: #2c3e50; padding: 25px; border-radius: 6px; border: 2px solid #1abc9c; width: 350px; color: white; }
+        .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 15px; }
+        .modal-btn { padding: 8px 16px; border-radius: 4px; border: none; font-weight: bold; cursor: pointer; }
+        .modal-save { background: #1abc9c; color: white; }
+        .modal-cancel { background: #7f8c8d; color: white; }
     </style>
 </head>
 <body>
+
+<div id="save-modal" class="modal">
+    <div class="modal-content">
+        <h4 style="margin-top:0; color:#1abc9c;">Create New Map File</h4>
+        <label class="control-label">Enter Map Name</label>
+        <input type="text" id="save-map-name" placeholder="E.g., Site Blueprint A">
+        <div class="modal-actions">
+            <button class="modal-btn modal-cancel" onclick="closeSaveModal()">Cancel</button>
+            <button class="modal-btn modal-save" onclick="confirmModalSave()">Create Map</button>
+        </div>
+    </div>
+</div>
 
 <div id="app-container">
     <div id="sidebar">
@@ -193,8 +213,6 @@ HTML_MAIN = """
                     drawnItems.addLayer(layer);
                     shapeOrderStack.push(layer);
                     if (feature.properties && feature.properties.label) {
-                        layer.shapeLabel = feature.properties.label;
-                        // Setup the label structure but keep it unbound/hidden initially
                         bindHiddenTooltip(layer, feature.properties.label);
                     }
                 }
@@ -202,7 +220,6 @@ HTML_MAIN = """
         });
     }
 
-    // Assigns label context to layer properties without mapping to active UI view
     function bindHiddenTooltip(layer, labelText) {
         layer.shapeLabel = labelText;
     }
@@ -259,7 +276,6 @@ HTML_MAIN = """
         document.getElementById('slide-scale').value = 100;
         document.getElementById('shape-label').value = layer.shapeLabel || "";
 
-        // Dynamically mount and open label only when the shape gets clicked
         if (layer.shapeLabel && layer.shapeLabel.trim() !== "") {
             layer.bindTooltip(layer.shapeLabel, {
                 permanent: true, direction: 'center', className: 'shape-label-tooltip'
@@ -273,7 +289,6 @@ HTML_MAIN = """
             if (selectedLayer instanceof L.Polyline && !(selectedLayer instanceof L.Polygon)) normalColor = '#e74c3c';
             selectedLayer.setStyle({ color: normalColor, dashArray: null });
 
-            // Cleanly unbind and conceal tooltip upon deselection phase
             selectedLayer.unbindTooltip();
         }
         selectedLayer = null;
@@ -308,7 +323,6 @@ HTML_MAIN = """
         selectedLayer.setLatLngs(newLatLngs);
         selectedLayer.redraw();
 
-        // Re-open active selection labels to update alignment positioning shifts
         if (selectedLayer.shapeLabel && selectedLayer.shapeLabel.trim() !== "") {
             selectedLayer.openTooltip();
         }
@@ -347,6 +361,50 @@ HTML_MAIN = """
             return item.map(subItem => shiftCoordsRecursive(subItem, latDel, lngDel));
         }
         return L.latLng(item.lat + latDel, item.lng + lngDel);
+    }
+
+    function openSaveModal() {
+        deselectShape();
+        document.getElementById('save-map-name').value = '';
+        document.getElementById('save-modal').style.display = 'flex';
+        document.getElementById('save-map-name').focus();
+    }
+
+    function closeSaveModal() {
+        document.getElementById('save-modal').style.display = 'none';
+    }
+
+    function confirmModalSave() {
+        const inputName = document.getElementById('save-map-name').value.trim();
+        if (!inputName) {
+            alert("Please enter a valid name for your layout.");
+            return;
+        }
+        currentLoadedMapName = inputName;
+        executeSilentAutosave();
+        closeSaveModal();
+    }
+
+    function executeSilentAutosave() {
+        if (!currentLoadedMapName) {
+            openSaveModal();
+            return;
+        }
+
+        drawnItems.eachLayer(function(layer) {
+            layer.feature = layer.feature || { type: "Feature", properties: {} };
+            if(layer.shapeLabel) {
+                layer.feature.properties.label = layer.shapeLabel;
+            }
+            if (layer instanceof L.Rectangle) {
+                layer.feature.properties.isRect = true;
+            }
+        });
+
+        const dataStr = JSON.stringify(drawnItems.toGeoJSON(), null, 4);
+        pywebview.api.save_gis_layer(currentLoadedMapName, dataStr).then(function(success) {
+            refreshLoadMenu();
+        });
     }
 
     window.addEventListener('keydown', function(event) {
@@ -390,7 +448,6 @@ HTML_MAIN = """
     }
 
     function exportDrawingToPDF() {
-        // Unbind completely ensures labels don't get trapped inside final image exports natively
         drawnItems.eachLayer(layer => layer.unbindTooltip());
         deselectShape(); 
 
@@ -416,4 +473,74 @@ HTML_MAIN = """
 </html>
 """
 
-# Include existing backend class components here exactly as written before
+
+class Api:
+    def save_gis_layer(self, map_name, geojson_data):
+        safe_name = "".join([c for c in map_name if c.isalpha() or c.isdigit() or c in (' ', '_', '-')]).strip()
+        filename = f"{safe_name}.json"
+        with open(filename, "w") as f:
+            f.write(geojson_data)
+        print(f"Map changes updated inside profile storage layout: '{filename}'")
+        return True
+
+    def list_saved_maps(self):
+        files = glob.glob("*.json")
+        return sorted(files)
+
+    def load_gis_layer(self, filename):
+        if os.path.exists(filename):
+            with open(filename, "r") as f:
+                return f.read()
+        return ""
+
+    def convert_image_to_pdf(self, base64_image_data):
+        try:
+            import base64
+            from io import BytesIO
+            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.pdfgen import canvas
+            from reportlab.lib.utils import ImageReader
+
+            if "," in base64_image_data:
+                base64_image_data = base64_image_data.split(",")[1]
+
+            img_bytes = base64.b64decode(base64_image_data)
+            img_buffer = BytesIO(img_bytes)
+            img_reader = ImageReader(img_buffer)
+
+            pdf_path = "drawn_canvas_blueprint.pdf"
+            pdf_canvas = canvas.Canvas(pdf_path, pagesize=landscape(A4))
+            page_width, page_height = landscape(A4)
+
+            pdf_canvas.drawImage(img_reader, 0, 0, width=page_width, height=page_height)
+            pdf_canvas.save()
+
+            print(f"Success! Canvas map blueprint cleared. Document saved to '{pdf_path}'")
+        except Exception as e:
+            print(f"Backend image pipeline writing failed: {e}")
+
+
+def start_server():
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("", PORT), http.server.SimpleHTTPRequestHandler) as httpd:
+        global HTML_MAIN
+
+        class InlineHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html')
+                self.end_headers()
+                self.wfile.write(HTML_MAIN.encode('utf-8'))
+
+        httpd.RequestHandlerClass = InlineHandler
+        httpd.serve_forever()
+
+
+if __name__ == '__main__':
+    server_thread = threading.Thread(target=start_server, daemon=True)
+    server_thread.start()
+
+    api = Api()
+    webview.create_window('Scale-Accurate Precision GIS Studio', url=f'http://localhost:{PORT}', js_api=api, width=1200,
+                          height=800)
+    webview.start()
