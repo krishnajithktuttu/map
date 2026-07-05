@@ -8,7 +8,7 @@ import webview
 
 PORT = 8080
 
-# --- Clean HTML/JS Interface Engine with Full Persistent Features ---
+# --- Clean HTML/JS Interface Engine with Multi-Page Vector Export ---
 HTML_MAIN = """
 <!DOCTYPE html>
 <html>
@@ -46,9 +46,17 @@ HTML_MAIN = """
             box-shadow: none !important;
             color: #ffffff !important;
             font-weight: bold !important;
+            font-family: sans-serif !important;
             font-size: 14px !important;
             text-shadow: 1px 1px 2px #000, -1px -1px 2px #000;
             pointer-events: none !important;
+            white-space: nowrap !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            box-sizing: content-box !important;
+        }
+        .shape-label-tooltip::before {
+            display: none !important;
         }
 
         /* Modal popup overlay */
@@ -58,9 +66,34 @@ HTML_MAIN = """
         .modal-btn { padding: 8px 16px; border-radius: 4px; border: none; font-weight: bold; cursor: pointer; }
         .modal-save { background: #1abc9c; color: white; }
         .modal-cancel { background: #7f8c8d; color: white; }
+
+        /* Save success toast notification */
+        #toast-notification {
+            position: fixed;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%) translateY(20px);
+            background: #27ae60;
+            color: white;
+            padding: 12px 26px;
+            border-radius: 6px;
+            font-weight: bold;
+            font-size: 14px;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+            z-index: 5000;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s ease, transform 0.3s ease;
+        }
+        #toast-notification.show {
+            opacity: 1;
+            transform: translateX(-50%) translateY(0);
+        }
     </style>
 </head>
 <body>
+
+<div id="toast-notification">Saved successfully!</div>
 
 <div id="save-modal" class="modal">
     <div class="modal-content">
@@ -118,7 +151,7 @@ HTML_MAIN = """
             </select>
         </div>
 
-        <button onclick="exportDrawingToPDF()" style="background: #2980b9; text-align: center; margin-top: auto;">Export Drawing to PDF</button>
+        <button onclick="exportDrawingToVectorPDF()" style="background: #2980b9; text-align: center; margin-top: auto;">Export Drawing to PDF</button>
         <button onclick="clearMap()" style="background: #e74c3c; text-align: center;">Clear Workspace</button>
     </div>
 
@@ -127,7 +160,6 @@ HTML_MAIN = """
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
-<script src="https://unpkg.com/leaflet-simple-map-screenshoter"></script>
 
 <script>
     const normalMap = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -153,20 +185,28 @@ HTML_MAIN = """
     };
     L.control.layers(baseLayers, null, { position: 'topright', collapsed: false }).addTo(map);
 
-    const screenshoter = L.simpleMapScreenshoter({
-        hidden: true, cropImageByInnerWH: true
-    }).addTo(map);
-
     const drawnItems = new L.FeatureGroup().addTo(map);
     let shapeOrderStack = [];
     let activeDrawHandler = null;
     let selectedLayer = null;
     let baseCoordinates = null; 
     let currentLoadedMapName = ""; 
+    let toastTimeoutHandle = null;
 
     window.addEventListener('pywebviewready', function() {
         refreshLoadMenu();
     });
+
+    function showToast(message, color) {
+        const toastEl = document.getElementById('toast-notification');
+        toastEl.textContent = message;
+        toastEl.style.background = color || '#27ae60';
+        toastEl.classList.add('show');
+        if (toastTimeoutHandle) clearTimeout(toastTimeoutHandle);
+        toastTimeoutHandle = setTimeout(function() {
+            toastEl.classList.remove('show');
+        }, 2200);
+    }
 
     function refreshLoadMenu() {
         pywebview.api.list_saved_maps().then(function(response) {
@@ -264,6 +304,12 @@ HTML_MAIN = """
         deselectShape();
     });
 
+    map.on('zoomend', function() {
+        if (selectedLayer && selectedLayer.shapeLabel && selectedLayer.shapeLabel.trim() !== "") {
+            fitLabelToShape(selectedLayer);
+        }
+    });
+
     function selectShape(layer) {
         deselectShape();
         selectedLayer = layer;
@@ -280,6 +326,7 @@ HTML_MAIN = """
             layer.bindTooltip(layer.shapeLabel, {
                 permanent: true, direction: 'center', className: 'shape-label-tooltip'
             }).openTooltip();
+            fitLabelToShape(layer);
         }
     }
 
@@ -309,6 +356,147 @@ HTML_MAIN = """
             selectedLayer.bindTooltip(textVal, {
                 permanent: true, direction: 'center', className: 'shape-label-tooltip'
             }).openTooltip();
+            fitLabelToShape(selectedLayer);
+        }
+    }
+
+    // Computes the on-screen pixel width/height of a shape's bounding box
+    function getShapePixelBounds(layer) {
+        const bounds = layer.getBounds();
+        const nw = map.latLngToLayerPoint(bounds.getNorthWest());
+        const se = map.latLngToLayerPoint(bounds.getSouthEast());
+        return {
+            width: Math.abs(se.x - nw.x),
+            height: Math.abs(se.y - nw.y)
+        };
+    }
+
+    // Outer ring of a polygon/rectangle layer, converted to screen pixel points
+    function getPolygonPixelRing(layer) {
+        let ring = layer.getLatLngs();
+        while (Array.isArray(ring[0])) {
+            ring = ring[0];
+        }
+        return ring.map(function(ll) { return map.latLngToLayerPoint(ll); });
+    }
+
+    // Finds how much horizontal/vertical space is actually INSIDE the polygon
+    // at the row/column that passes through its center, by ray-casting against
+    // every edge. This is what a bounding-box check misses: a triangle or any
+    // non-rectangular shape has a lot less usable interior than its bbox.
+    function getInteriorExtentsAtCenter(ringPoints, center) {
+        function extentAlong(axisIsY, fixedVal, movingVal) {
+            const hits = [];
+            for (let i = 0; i < ringPoints.length; i++) {
+                const p1 = ringPoints[i];
+                const p2 = ringPoints[(i + 1) % ringPoints.length];
+                const a1 = axisIsY ? p1.y : p1.x;
+                const a2 = axisIsY ? p2.y : p2.x;
+                const b1 = axisIsY ? p1.x : p1.y;
+                const b2 = axisIsY ? p2.x : p2.y;
+                if ((a1 <= fixedVal && a2 > fixedVal) || (a2 <= fixedVal && a1 > fixedVal)) {
+                    const t = (fixedVal - a1) / (a2 - a1);
+                    hits.push(b1 + t * (b2 - b1));
+                }
+            }
+            hits.sort(function(a, b) { return a - b; });
+            for (let i = 0; i < hits.length - 1; i += 2) {
+                if (movingVal >= hits[i] && movingVal <= hits[i + 1]) {
+                    return hits[i + 1] - hits[i];
+                }
+            }
+            if (hits.length >= 2) return hits[hits.length - 1] - hits[0];
+            return 0;
+        }
+
+        return {
+            width: extentAlong(true, center.y, center.x),
+            height: extentAlong(false, center.x, center.y)
+        };
+    }
+
+    // Shrinks the tooltip font so the label text fits inside the shape's own interior.
+    // Small shapes get a small font, but the label is never hidden outright - a slightly
+    // tight label on a tiny building beats no label at all.
+    function fitLabelToShape(layer) {
+        if (!layer.shapeLabel || layer.shapeLabel.trim() === "") return;
+        const tooltip = layer.getTooltip();
+        if (!tooltip) return;
+        const tooltipEl = tooltip.getElement();
+        if (!tooltipEl) return;
+
+        const MIN_USABLE = 6; // smallest legible font size, in px
+
+        let maxWidth, maxHeight;
+
+        if (layer instanceof L.Polygon) {
+            const ringPoints = getPolygonPixelRing(layer);
+            const centerLatLng = (typeof layer.getCenter === 'function') ? layer.getCenter() : layer.getBounds().getCenter();
+            const centerPoint = map.latLngToLayerPoint(centerLatLng);
+            const extents = getInteriorExtentsAtCenter(ringPoints, centerPoint);
+            maxWidth = extents.width * 0.82;
+            maxHeight = extents.height * 0.6;
+        } else {
+            const pixelBounds = getShapePixelBounds(layer);
+            maxWidth = pixelBounds.width * 0.8;
+            maxHeight = pixelBounds.height * 0.5;
+        }
+
+        // Never let the box collapse to nothing - always leave room for the minimum font
+        maxWidth = Math.max(maxWidth, MIN_USABLE);
+        maxHeight = Math.max(maxHeight, MIN_USABLE);
+
+        tooltipEl.style.display = 'inline-block';
+        tooltipEl.style.whiteSpace = 'nowrap';
+        tooltipEl.style.padding = '0';
+        tooltipEl.style.margin = '0';
+
+        // Step 1: cheap estimate via canvas text measurement to pick a starting point
+        if (!fitLabelToShape._canvas) {
+            fitLabelToShape._canvas = document.createElement('canvas');
+        }
+        const ctx = fitLabelToShape._canvas.getContext('2d');
+        const refSize = 100;
+        ctx.font = `bold ${refSize}px sans-serif`;
+        const textWidth = ctx.measureText(layer.shapeLabel).width;
+
+        let fontSize;
+        if (textWidth > 0) {
+            fontSize = Math.min((maxWidth / textWidth) * refSize, maxHeight);
+        } else {
+            fontSize = maxHeight;
+        }
+        fontSize = Math.max(MIN_USABLE, Math.min(fontSize, 22));
+
+        tooltipEl.style.fontSize = fontSize + 'px';
+        tooltipEl.style.lineHeight = fontSize + 'px';
+
+        // Step 2: refine against the *actual* rendered box (real font metrics, no guesswork).
+        // Shrink until it fits, but never go below the legible floor - a tiny building's
+        // label may then sit slightly tight against the edges rather than disappear.
+        let guard = 0;
+        while (guard < 60 && fontSize > MIN_USABLE &&
+               (tooltipEl.offsetWidth > maxWidth || tooltipEl.offsetHeight > maxHeight)) {
+            fontSize -= 1;
+            tooltipEl.style.fontSize = fontSize + 'px';
+            tooltipEl.style.lineHeight = fontSize + 'px';
+            guard++;
+        }
+
+        // In case the estimate undershot, try growing back up slightly without exceeding bounds
+        guard = 0;
+        while (guard < 40 && fontSize < 22 &&
+               (tooltipEl.offsetWidth < maxWidth && tooltipEl.offsetHeight < maxHeight)) {
+            const nextSize = fontSize + 1;
+            tooltipEl.style.fontSize = nextSize + 'px';
+            tooltipEl.style.lineHeight = nextSize + 'px';
+            if (tooltipEl.offsetWidth > maxWidth || tooltipEl.offsetHeight > maxHeight) {
+                tooltipEl.style.fontSize = fontSize + 'px';
+                tooltipEl.style.lineHeight = fontSize + 'px';
+                break;
+            }
+            fontSize = nextSize;
+            guard++;
         }
     }
 
@@ -325,6 +513,7 @@ HTML_MAIN = """
 
         if (selectedLayer.shapeLabel && selectedLayer.shapeLabel.trim() !== "") {
             selectedLayer.openTooltip();
+            fitLabelToShape(selectedLayer);
         }
     }
 
@@ -404,6 +593,9 @@ HTML_MAIN = """
         const dataStr = JSON.stringify(drawnItems.toGeoJSON(), null, 4);
         pywebview.api.save_gis_layer(currentLoadedMapName, dataStr).then(function(success) {
             refreshLoadMenu();
+            if (success) {
+                showToast('Saved successfully!');
+            }
         });
     }
 
@@ -447,26 +639,34 @@ HTML_MAIN = """
         shapeOrderStack = [];
     }
 
-    function exportDrawingToPDF() {
-        drawnItems.eachLayer(layer => layer.unbindTooltip());
-        deselectShape(); 
+    function exportDrawingToVectorPDF() {
+        deselectShape();
 
-        let activeTile = null;
-        if (map.hasLayer(normalMap)) activeTile = normalMap;
-        else if (map.hasLayer(satelliteCleanMap)) activeTile = satelliteCleanMap;
-        else if (map.hasLayer(satelliteHybridMap)) activeTile = satelliteHybridMap;
+        drawnItems.eachLayer(function(layer) {
+            layer.feature = layer.feature || { type: "Feature", properties: {} };
+            if(layer.shapeLabel) layer.feature.properties.label = layer.shapeLabel;
+            if (layer instanceof L.Rectangle) layer.feature.properties.isRect = true;
+        });
 
-        if (activeTile) map.removeLayer(activeTile);
+        const bounds = map.getBounds();
+        const payload = {
+            geojson: drawnItems.toGeoJSON(),
+            mapName: currentLoadedMapName || "Untitled_Map",
+            bbox: {
+                west: bounds.getWest(),
+                east: bounds.getEast(),
+                south: bounds.getSouth(),
+                north: bounds.getNorth()
+            }
+        };
 
-        setTimeout(() => {
-            screenshoter.takeScreen('image').then(base64Image => {
-                if (activeTile) activeTile.addTo(map);
-                pywebview.api.convert_image_to_pdf(base64Image);
-            }).catch(err => {
-                if (activeTile) activeTile.addTo(map);
-                alert("Export pipeline failed: " + err);
-            });
-        }, 100); 
+        pywebview.api.generate_indexed_vector_pdf(JSON.stringify(payload)).then(function(result) {
+            if (result && result.success) {
+                showToast('PDF exported successfully!', '#2980b9');
+            } else {
+                showToast('PDF export failed', '#c0392b');
+            }
+        });
     }
 </script>
 </body>
@@ -493,32 +693,174 @@ class Api:
                 return f.read()
         return ""
 
-    def convert_image_to_pdf(self, base64_image_data):
+    def generate_indexed_vector_pdf(self, payload_str):
         try:
-            import base64
-            from io import BytesIO
             from reportlab.lib.pagesizes import A4, landscape
             from reportlab.pdfgen import canvas
-            from reportlab.lib.utils import ImageReader
+            from reportlab.lib import colors
 
-            if "," in base64_image_data:
-                base64_image_data = base64_image_data.split(",")[1]
+            payload = json.loads(payload_str)
+            geojson = payload["geojson"]
+            bbox = payload["bbox"]
+            map_name = payload.get("mapName") or "Untitled_Map"
 
-            img_bytes = base64.b64decode(base64_image_data)
-            img_buffer = BytesIO(img_bytes)
-            img_reader = ImageReader(img_buffer)
+            safe_name = "".join([c for c in map_name if c.isalpha() or c.isdigit() or c in (' ', '_', '-')]).strip()
+            if not safe_name:
+                safe_name = "Untitled_Map"
+            pdf_path = f"{safe_name}.pdf"
 
-            pdf_path = "drawn_canvas_blueprint.pdf"
+            # Canvas() opens the file in write mode, so an existing PDF with the
+            # same name is replaced automatically.
             pdf_canvas = canvas.Canvas(pdf_path, pagesize=landscape(A4))
-            page_width, page_height = landscape(A4)
+            page_w, page_h = landscape(A4)
+            margin = 50
 
-            pdf_canvas.drawImage(img_reader, 0, 0, width=page_width, height=page_height)
+            def polygon_centroid(points):
+                cx = sum(p[0] for p in points) / len(points)
+                cy = sum(p[1] for p in points) / len(points)
+                return cx, cy
+
+            def interior_extent_at_center(points, center):
+                """How much horizontal/vertical space is actually INSIDE the polygon
+                at the row/column through its center — a bounding box overstates this
+                for anything non-rectangular (triangles, slivers, L-shapes, etc.)."""
+                cx, cy = center
+                n = len(points)
+
+                def extent_along(axis_is_y, fixed_val, moving_val):
+                    hits = []
+                    for i in range(n):
+                        p1 = points[i]
+                        p2 = points[(i + 1) % n]
+                        a1 = p1[1] if axis_is_y else p1[0]
+                        a2 = p2[1] if axis_is_y else p2[0]
+                        b1 = p1[0] if axis_is_y else p1[1]
+                        b2 = p2[0] if axis_is_y else p2[1]
+                        if (a1 <= fixed_val < a2) or (a2 <= fixed_val < a1):
+                            t = (fixed_val - a1) / (a2 - a1)
+                            hits.append(b1 + t * (b2 - b1))
+                    hits.sort()
+                    for i in range(0, len(hits) - 1, 2):
+                        if hits[i] <= moving_val <= hits[i + 1]:
+                            return hits[i + 1] - hits[i]
+                    if len(hits) >= 2:
+                        return hits[-1] - hits[0]
+                    return 0
+
+                width = extent_along(True, cy, cx)
+                height = extent_along(False, cx, cy)
+                return width, height
+
+            def fit_font_size(canvas_obj, text, max_width, max_height,
+                               font_name="Helvetica-Bold", max_size=10.0, min_size=4.0):
+                """Largest font size (in min_size..max_size) whose rendered width/height
+                stay inside the given box. If the shape is too small for even min_size to
+                fit cleanly, still returns min_size — a slightly tight label beats a
+                missing one for small buildings."""
+                size = max_size
+                while size > min_size:
+                    text_w = canvas_obj.stringWidth(text, font_name, size)
+                    if text_w <= max_width and size <= max_height:
+                        return size
+                    size -= 0.5
+                return min_size
+
+            def draw_geometry(canvas_obj, draw_labels=False):
+                draw_w = page_w - (2 * margin)
+                draw_h = page_h - (2 * margin)
+                bbox_w = bbox["east"] - bbox["west"]
+                bbox_h = bbox["north"] - bbox["south"]
+
+                def map_coords(lng, lat):
+                    x = margin + ((lng - bbox["west"]) / bbox_w) * draw_w
+                    y = margin + ((lat - bbox["south"]) / bbox_h) * draw_h
+                    return x, y
+
+                index = 1
+                for feature in geojson.get("features", []):
+                    geom = feature.get("geometry", {})
+                    props = feature.get("properties", {})
+                    g_type = geom.get("type")
+                    coords = geom.get("coordinates", [])
+
+                    if g_type in ["Polygon", "MultiPolygon"]:
+                        color = colors.HexColor("#27ae60") if props.get("isRect") else colors.HexColor("#9b59b6")
+                        canvas_obj.setStrokeColor(color)
+                        canvas_obj.setLineWidth(0.25)
+
+                        rings = coords if g_type == "Polygon" else coords[0]
+                        for ring in rings:
+                            path = canvas_obj.beginPath()
+                            for i, pt in enumerate(ring):
+                                x, y = map_coords(pt[0], pt[1])
+                                if i == 0:
+                                    path.moveTo(x, y)
+                                else:
+                                    path.lineTo(x, y)
+                            path.close()
+                            canvas_obj.drawPath(path, fill=0, stroke=1)
+
+                        if draw_labels:
+                            ring_pts = [map_coords(p[0], p[1]) for p in rings[0]]
+                            center = polygon_centroid(ring_pts)
+                            extent_w, extent_h = interior_extent_at_center(ring_pts, center)
+                            # Breathing room so the digits never touch the polygon's edge
+                            # (small/degenerate extents just mean the shape can't offer
+                            # much room - fit_font_size falls back to a legible minimum)
+                            max_w = max(extent_w * 0.8, 0.1)
+                            max_h = max(extent_h * 0.6, 0.1)
+
+                            label_text = str(index)
+                            font_size = fit_font_size(canvas_obj, label_text, max_w, max_h)
+                            canvas_obj.setFont("Helvetica-Bold", font_size)
+                            canvas_obj.setFillColor(colors.HexColor("#2c3e50"))
+                            canvas_obj.drawCentredString(center[0], center[1] - font_size * 0.35, label_text)
+                        index += 1
+
+                    elif g_type == "LineString":
+                        canvas_obj.setStrokeColor(colors.HexColor("#e74c3c"))
+                        canvas_obj.setLineWidth(0.25)
+                        path = canvas_obj.beginPath()
+                        for i, pt in enumerate(coords):
+                            x, y = map_coords(pt[0], pt[1])
+                            if i == 0:
+                                path.moveTo(x, y)
+                            else:
+                                path.lineTo(x, y)
+                        canvas_obj.drawPath(path, fill=0, stroke=1)
+
+            # Page 1 & 2: Maps
+            draw_geometry(pdf_canvas, draw_labels=True)
+            pdf_canvas.showPage()
+            draw_geometry(pdf_canvas, draw_labels=False)
+            pdf_canvas.showPage()
+
+            # Page 3+: Auto-paginated Legend
+            pdf_canvas.setFont("Helvetica-Bold", 16)
+            pdf_canvas.drawString(margin, page_h - 60, "Map Index Description Legend")
+
+            y_cursor = page_h - 100
+            pdf_canvas.setFont("Helvetica", 10)
+
+            idx = 1
+            for feature in geojson.get("features", []):
+                if feature["geometry"]["type"] in ["Polygon", "MultiPolygon"]:
+                    # Create new page if we run out of vertical space
+                    if y_cursor < margin:
+                        pdf_canvas.showPage()
+                        y_cursor = page_h - 60
+
+                    label = feature["properties"].get("label", "Unnamed")
+                    pdf_canvas.drawString(margin, y_cursor, f"{idx}. {label}")
+                    y_cursor -= 20
+                    idx += 1
+
             pdf_canvas.save()
-
-            print(f"Success! Canvas map blueprint cleared. Document saved to '{pdf_path}'")
+            print(f"PDF generated with auto-pagination: '{pdf_path}'")
+            return {"success": True, "filename": pdf_path}
         except Exception as e:
-            print(f"Backend image pipeline writing failed: {e}")
-
+            print(f"Error: {e}")
+            return {"success": False, "error": str(e)}
 
 def start_server():
     socketserver.TCPServer.allow_reuse_address = True
