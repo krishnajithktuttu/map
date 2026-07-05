@@ -1,153 +1,220 @@
-import tkinter as tk
-from tkinter import messagebox
-from PIL import Image, ImageDraw
+import http.server
+import socketserver
+import threading
+import json
+import webview
 
+PORT = 8080
 
-class LayeredDrawApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Layered Map & Drawing App")
-        self.root.geometry("900x650")
+# --- The Front-End Web-Interface (HTML, Leaflet Map, and Fabric Drawing Canvas) ---
+HTML_MAIN = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Live Map Layer Workbench</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body, html { margin: 0; padding: 0; height: 100%; width: 100%; font-family: sans-serif; overflow: hidden; background: #2c3e50; }
+        #app-container { display: flex; flex-direction: column; height: 100vh; }
+        #toolbar { background: #2c3e50; color: white; padding: 12px; display: flex; gap: 10px; align-items: center; box-shadow: 0 2px 10px rgba(0,0,0,0.3); z-index: 3000; }
+        button { background: #34495e; color: white; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-weight: bold; transition: 0.2s; }
+        button:hover { background: #1abc9c; }
+        #map-wrapper { flex: 1; position: relative; width: 100%; height: 100%; }
 
-        # Canvas Dimensions
-        self.width = 800
-        self.height = 550
+        /* Layer 1: The Live Global Map */
+        #map { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; }
 
-        # --- Data Model (The Layers) ---
-        # Layer 1: Simulated Map Background data
-        self.map_layer_objects = [
-            {"type": "grid", "color": "#e0e0e0"},
-            {"type": "road", "coords": [100, 400, 700, 400], "color": "#9de291", "width": 20}
-        ]
-        # Layer 2: User Drawings
-        self.drawing_layer_objects = []
+        /* Layer 2: The Drawing Interaction Overlay */
+        #canvas-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none; }
 
-        # App States
-        self.current_tool = "line"
-        self.start_x = None
-        self.start_y = None
-        self.preview_obj = None
+        /* When drawing or editing, unlock mouse events for the front canvas */
+        .interaction-active #canvas-container { pointer-events: auto; }
+    </style>
+</head>
+<body>
 
-        # --- UI Layout ---
-        toolbar = tk.Frame(root, bg="#eaeaea", bd=1, relief=tk.RAISED)
-        toolbar.pack(side=tk.TOP, fill=tk.X)
+<div id="app-container" class="interaction-active">
+    <div id="toolbar">
+        <button onclick="setMode('edit')">Interact / Move / Elongate 🖐️</button>
+        <button onclick="setMode('draw-line')">Smooth Line ➖</button>
+        <button onclick="setMode('draw-rect')">Rectangle ⬜</button>
+        <button onclick="clearCanvas()" style="background: #e74c3c;">Clear Drawings 🧹</button>
+        <button onclick="exportLayers()" style="background: #27ae60; margin-left: auto;">Export Drawings 📤</button>
+    </div>
 
-        # Tools
-        tk.Label(toolbar, text="Tools:", bg="#eaeaea").pack(side=tk.LEFT, padx=5)
-        tk.Button(toolbar, text="Line", command=lambda: self.set_tool("line")).pack(side=tk.LEFT, padx=2)
-        tk.Button(toolbar, text="Rect", command=lambda: self.set_tool("rectangle")).pack(side=tk.LEFT, padx=2)
+    <div id="map-wrapper">
+        <div id="map"></div>
+        <div id="canvas-container">
+            <canvas id="drawingCanvas"></canvas>
+        </div>
+    </div>
+</div>
 
-        # Action Buttons
-        tk.Button(toolbar, text="Export Drawing Only", command=self.export_drawing_layer, fg="blue").pack(side=tk.RIGHT,
-                                                                                                          padx=5,
-                                                                                                          pady=5)
-        tk.Button(toolbar, text="Export Merged Map", command=self.export_merged, fg="green").pack(side=tk.RIGHT, padx=5,
-                                                                                                  pady=5)
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.3.1/fabric.min.js"></script>
 
-        # Canvas
-        self.canvas = tk.Canvas(root, bg="white", width=self.width, height=self.height, cursor="cross")
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+<script>
+    const wrapper = document.getElementById('map-wrapper');
+    const canvasEl = document.getElementById('drawingCanvas');
 
-        # Bindings
-        self.canvas.bind("<ButtonPress-1>", self.on_press)
-        self.canvas.bind("<B1-Motion>", self.on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self.on_release)
+    // Size the canvas to take up the full map screen area
+    canvasEl.width = wrapper.clientWidth;
+    canvasEl.height = wrapper.clientHeight;
 
-        # Initial Render
-        self.draw_all_layers()
+    // 1. Initialize Global Interactive Map Layer
+    const map = L.map('map', {
+        zoomControl: true,
+        scrollWheelZoom: true
+    }).setView([12.5055, 74.9902], 16); // Centered over Kasaragod block coordinates
 
-    def set_tool(self, tool):
-        self.current_tool = tool
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '© OpenStreetMap'
+    }).addTo(map);
 
-    def draw_all_layers(self):
-        """Clears the screen and builds the visual stack from bottom to top."""
-        self.canvas.delete("all")
+    // 2. Initialize Fabric Vector Drawing Canvas
+    const canvas = new fabric.Canvas('drawingCanvas', {
+        width: wrapper.clientWidth,
+        height: wrapper.clientHeight,
+        selection: true
+    });
 
-        # 1. Draw Map Background Layer (Bottom)
-        for obj in self.map_layer_objects:
-            if obj["type"] == "grid":
-                for i in range(0, self.width, 40):
-                    self.canvas.create_line(i, 0, i, self.height, fill=obj["color"])
-                    self.canvas.create_line(0, i, self.width, i, fill=obj["color"])
-            elif obj["type"] == "road":
-                self.canvas.create_line(*obj["coords"], fill=obj["color"], width=obj["width"])
+    let isDrawing = false;
+    let currentMode = 'edit';
+    let startPoint = null;
+    let activeObj = null;
 
-        # 2. Draw User Vector Layer (Top)
-        for obj in self.drawing_layer_objects:
-            if obj["type"] == "line":
-                self.canvas.create_line(*obj["coords"], fill=obj["color"], width=3)
-            elif obj["type"] == "rectangle":
-                self.canvas.create_rectangle(*obj["coords"], outline=obj["color"], width=3)
+    // Toggle between moving existing shapes or laying down new vectors
+    function setMode(mode) {
+        currentMode = mode;
+        const container = document.getElementById('app-container');
 
-    # --- Mouse Control Handling ---
-    def on_press(self, event):
-        self.start_x, self.start_y = event.x, event.y
-
-    def on_drag(self, event):
-        if self.preview_obj:
-            self.canvas.delete(self.preview_obj)
-
-        if self.current_tool == "line":
-            self.preview_obj = self.canvas.create_line(self.start_x, self.start_y, event.x, event.y, fill="red",
-                                                       width=2)
-        elif self.current_tool == "rectangle":
-            self.preview_obj = self.canvas.create_rectangle(self.start_x, self.start_y, event.x, event.y, outline="red",
-                                                            width=2)
-
-    def on_release(self, event):
-        if self.preview_obj:
-            self.canvas.delete(self.preview_obj)
-
-        # Save data structurally to the drawing layer data array
-        new_shape = {
-            "type": self.current_tool,
-            "coords": [self.start_x, self.start_y, event.x, event.y],
-            "color": "blue"
+        if (mode === 'edit') {
+            // Let user pan the actual back map if clicking an empty space
+            container.classList.remove('interaction-active'); 
+            canvas.selection = true;
+            canvas.forEachObject(obj => obj.selectable = true);
+        } else {
+            // Lock map panning to allow clean drawing paths
+            container.classList.add('interaction-active');
+            canvas.selection = false;
+            canvas.forEachObject(obj => obj.selectable = false);
         }
-        self.drawing_layer_objects.append(new_shape)
-        self.draw_all_layers()
+    }
 
-    # --- Extraction & Merging Logic ---
-    def export_drawing_layer(self):
-        """Extracts ONLY the drawing layer as a transparent PNG asset."""
-        img = Image.new("RGBA", (self.width, self.height), (255, 255, 255, 0))  # Alpha = 0 (Transparent)
-        draw = ImageDraw.Draw(img)
+    // Capture initial mouse coordinate clicks
+    canvas.on('mouse:down', function(options) {
+        if (currentMode === 'edit') return;
+        isDrawing = true;
+        const pointer = canvas.getPointer(options.e);
+        startPoint = { x: pointer.x, y: pointer.y };
 
-        for obj in self.drawing_layer_objects:
-            if obj["type"] == "line":
-                draw.line(obj["coords"], fill="blue", width=3)
-            elif obj["type"] == "rectangle":
-                draw.rectangle(obj["coords"], outline="blue", width=3)
+        if (currentMode === 'draw-line') {
+            activeObj = new fabric.Line([startPoint.x, startPoint.y, startPoint.x, startPoint.y], {
+                stroke: '#e74c3c',
+                strokeWidth: 4,
+                strokeLineCap: 'round',
+                hasControls: true
+            });
+        } else if (currentMode === 'draw-rect') {
+            activeObj = new fabric.Rect({
+                left: startPoint.x,
+                top: startPoint.y,
+                width: 0,
+                height: 0,
+                fill: 'rgba(231, 76, 60, 0.2)',
+                stroke: '#e74c3c',
+                strokeWidth: 3,
+                hasControls: true
+            });
+        }
+        canvas.add(activeObj);
+    });
 
-        img.save("extracted_drawing_layer.png")
-        messagebox.showinfo("Success", "Exported standalone drawing layer to 'extracted_drawing_layer.png'!")
+    // Handle interactive drag resize preview frames
+    canvas.on('mouse:move', function(options) {
+        if (!isDrawing || currentMode === 'edit') return;
+        const pointer = canvas.getPointer(options.e);
 
-    def export_merged(self):
-        """Bakes both layers down together into one flat JPEG image."""
-        img = Image.new("RGB", (self.width, self.height), "white")
-        draw = ImageDraw.Draw(img)
+        if (currentMode === 'draw-line') {
+            activeObj.set({ x2: pointer.x, y2: pointer.y });
+        } else if (currentMode === 'draw-rect') {
+            let width = pointer.x - startPoint.x;
+            let height = pointer.y - startPoint.y;
+            activeObj.set({
+                width: Math.abs(width),
+                height: Math.abs(height),
+                left: width > 0 ? startPoint.x : pointer.x,
+                top: height > 0 ? startPoint.y : pointer.y
+            });
+        }
+        canvas.renderAll();
+    });
 
-        # 1. Rasterize Map Layer
-        for obj in self.map_layer_objects:
-            if obj["type"] == "grid":
-                for i in range(0, self.width, 40):
-                    draw.line([i, 0, i, self.height], fill="#e0e0e0")
-                    draw.line([0, i, self.width, i], fill="#e0e0e0")
-            elif obj["type"] == "road":
-                draw.line(obj["coords"], fill="#9de291", width=20)
+    // Snap objects directly into shape transform frameworks on release
+    canvas.on('mouse:up', function() {
+        if (!isDrawing) return;
+        isDrawing = false;
+        activeObj.setCoords();
+        setMode('edit'); // Auto snap back to edit mode so shapes can immediately be adjusted
+    });
 
-        # 2. Rasterize Drawing Layer right over it
-        for obj in self.drawing_layer_objects:
-            if obj["type"] == "line":
-                draw.line(obj["coords"], fill="blue", width=3)
-            elif obj["type"] == "rectangle":
-                draw.rectangle(obj["coords"], outline="blue", width=3)
+    function clearCanvas() {
+        canvas.clear();
+    }
 
-        img.save("merged_map_output.jpg")
-        messagebox.showinfo("Success", "Exported fully merged composition to 'merged_map_output.jpg'!")
+    function exportLayers() {
+        const drawingsJson = JSON.stringify(canvas.toJSON());
+        pywebview.api.save_drawing_layer(drawingsJson);
+    }
+
+    // Keep layers aligned during app window resizing
+    window.addEventListener('resize', () => {
+        canvas.setWidth(wrapper.clientWidth);
+        canvas.setHeight(wrapper.clientHeight);
+        canvas.renderAll();
+    });
+</script>
+</body>
+</html>
+"""
 
 
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = LayeredDrawApp(root)
-    root.mainloop()
+def start_server():
+    """Hosts our map application code locally to grant it internet permissions."""
+
+    class CustomHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(HTML_MAIN.encode('utf-8'))
+
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("", PORT), CustomHandler) as httpd:
+        httpd.serve_forever()
+
+
+class Api:
+    def save_drawing_layer(self, json_data):
+        parsed_data = json.loads(json_data)
+        with open("extracted_map_shapes.json", "w") as f:
+            json.dump(parsed_data, f, indent=4)
+        print("Isolated vector drawings extracted successfully to 'extracted_map_shapes.json'!")
+
+
+if __name__ == '__main__':
+    # 1. Run local web server in background thread to unblock map textures
+    server_thread = threading.Thread(target=start_server, daemon=True)
+    server_thread.start()
+
+    # 2. Launch desktop window targeting our local app url server
+    api = Api()
+    webview.create_window(
+        'Live GIS Layer Workstation',
+        url=f'http://localhost:{PORT}',
+        js_api=api,
+        width=1100,
+        height=750
+    )
+    webview.start()
